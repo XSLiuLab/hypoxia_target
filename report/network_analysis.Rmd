@@ -1,0 +1,439 @@
+---
+title: "network analysis"
+author: "Tao Wu"
+date: "`r Sys.Date()`"
+output:   
+  rmdformats::readthedown:
+    highlight: kate
+    lightbox: false
+    toc_depth: 3
+    mathjax: true
+---
+
+```{r tcga_analysis-setup, include=FALSE}
+options(max.print = "75")
+knitr::opts_chunk$set(echo = TRUE, comment = "#>", eval = TRUE, collapse = TRUE,cache = FALSE)
+knitr::opts_knit$set(width = 75)
+```
+
+```{r}
+library(dplyr)
+library(ggpubr)
+```
+
+Sample specific GEMs were download in mat format and convert to xml format by Matlab. Then we applied the R package Met2Graph to extract enzyme network from GSMs. In this network, enzymes are the nodes connected by edges represented by metabolites. Two enzymes are connected if they catalyze two reactions which produce or consume a specific metabolite. The code for data format convertion can be found in `code/convert_gems.R`.
+
+We use Graph2Vec, an algorithm designed to learn vector representations  for whole graphs, to compute the embedding vector for each sample's enzyme network. Then we use cosine similarity to calculate the  similarity between pairs of enzyme networks (the code for calculating graph similarity can be found in `code/graph_sim.ipynb`). Based on the Buffa hypoxia  score, samples are divided into hypoxic (score greater than the upper  quartile) and non-hypoxic groups (score less than the lower quartile). We compared the differences in network similarity between samples with  the same hypoxia status and those with different hypoxia statuses.
+
+```{r}
+sim <- data.table::fread("/home/data/sdb/wt/enzyme_net_sim.csv",data.table = F)
+sim$V1 <- NULL
+rownames(sim) <- colnames(sim)
+
+hypo_score <- data.table::fread("~/hypoxia_target/data/Pancancer hypoxia scores.txt",
+                                data.table = F)
+hypo_score_summ <- hypo_score %>% 
+  group_by(tumour_type) %>% 
+  summarise(up_quan = quantile(Buffa_hypoxia_score_intra_tumour_type)[4],
+            down_quan = quantile(Buffa_hypoxia_score_intra_tumour_type)[2]) %>% 
+  ungroup()
+hypo_score <- hypo_score %>% 
+  mutate(patient_id = gsub("[.]","-",patient_id)) %>% 
+  select(patient_id, tumour_type, Buffa_hypoxia_score_intra_tumour_type) %>% 
+  rename(score = Buffa_hypoxia_score_intra_tumour_type) %>% 
+  left_join(.,hypo_score_summ) %>% 
+  rowwise() %>% 
+  mutate(hypo_type = case_when(
+    score < down_quan ~ "no-hypo",
+    score > up_quan ~ "hypo",
+    TRUE ~ "others"
+  )) %>% ungroup()
+hypo_score <- hypo_score %>% filter(hypo_type != "others")
+
+hypo_samples <- hypo_score$patient_id[which(hypo_score$hypo_type == "hypo")]
+no_hypo_samples <- hypo_score$patient_id[which(hypo_score$hypo_type == "no-hypo")]
+
+hypo_idx <- which(substr(colnames(sim),1,12) %in% hypo_samples)
+no_hypo_idx <- which(substr(colnames(sim),1,12) %in% no_hypo_samples)
+
+filter_sim <- sim[c(hypo_idx,no_hypo_idx),c(hypo_idx,no_hypo_idx)]
+filter_sim$row_sample <- rownames(filter_sim)
+need_ids <- paste0(rownames(filter_sim),"_",colnames(filter_sim))
+
+filter_sim <- filter_sim %>% 
+  select(row_sample,everything())
+filter_sim <- filter_sim %>% 
+  tidyr::pivot_longer(cols = 2:ncol(filter_sim), names_to = "col_sample",
+                      values_to = "sim")
+dt <- data.frame(
+  ids = c(hypo_samples,no_hypo_samples),
+  type = c(rep("hypo",length(hypo_samples)),rep("nohypo",length(no_hypo_samples)))
+)
+filter_sim <- filter_sim %>% 
+  mutate(row_id = substr(row_sample,1,12),
+         col_id = substr(col_sample,1,12)) %>% 
+  left_join(.,
+            dt %>% rename(row_id = ids,row_type=type)) %>% 
+  left_join(.,dt %>% rename(col_id = ids,col_type=type))
+filter_sim <- filter_sim %>% 
+  mutate(comb_type = paste0(row_type,"-",col_type))
+
+cancer_type <- data.frame(
+  ids = c(unique(filter_sim$row_id),unique(filter_sim$col_id))
+) %>% distinct_all()
+cancer_type$cancer <- EasyBioinfo::get_cancer_type(cancer_type$ids)
+
+filter_sim <- filter_sim %>% 
+  left_join(.,
+            cancer_type %>% rename(row_id = ids,row_cancer=cancer)) %>% 
+  left_join(.,cancer_type %>% rename(col_id = ids,col_cancer=cancer))
+
+library(igraph)
+dt <- graph_from_data_frame(filter_sim %>% select(1,2),directed = F)
+dt <- simplify(dt)
+dt_unique <- as_data_frame(dt) %>%
+  mutate(ids = paste0(from,"_",to))
+
+dt <- filter_sim %>% 
+  mutate(combid = paste0(row_sample,"_",col_sample)) %>% 
+  filter(combid %in% dt_unique$ids) %>% 
+  filter(row_cancer == col_cancer) %>% 
+  filter(row_id != col_id)
+dt <- dt %>% 
+  mutate(type2 = ifelse(col_type != row_type,"Type2","Type1"))
+p <- ggboxplot(dt,x="type2",y="sim",xlab = F,
+          ylab = "Similarity")+
+  stat_compare_means(label="p.format")
+facet(p, facet.by = "row_cancer", nrow = 3)
+```
+
+We also calculated metrics to measure the importance of gene nodes in the enzyme network, including degree centrality, which indicates the number of connections a gene node has with every other gene; betweenness centrality, quantifying the number of times a gene node appears on the shortest path between two other nodes; eigenvector centrality which quantifies a node's influence in the network based on its connections to other high-scoring gene nodes and closeness centrality, which calculates the length of the shortest path between a gene and all other genes in the network. These metrics were calculated by R package igraph:
+
+```{r eval=FALSE, include=TRUE}
+###计算所有样本网络的节点重要性得分
+all_files <- list.files("/home/data/sdb/wt/MetGraph/EnzGraphs/",
+                        pattern = "tsv")
+library(doParallel)
+library(foreach)
+my.cluster <- parallel::makeCluster(
+  60, 
+  type = "PSOCK"
+)
+doParallel::registerDoParallel(cl = my.cluster)
+res <- foreach(
+  i = all_files,
+  .packages = c("igraph","dplyr")
+) %dopar% {
+  tmp <- paste0("/home/data/sdb/wt/MetGraph/EnzGraphs/",i)
+  sample <- gsub("_enzymes_based_graph.tsv","",i)
+  dt <- data.table::fread(tmp, data.table = F)
+  dt <- dt %>% dplyr::select(from,to)
+  dt_g <- igraph::graph_from_data_frame(dt)
+  # Compute the degree centrality for our graph G. 
+  degr_cent <- igraph::degree(dt_g, v = V(dt_g), mode = "all", normalized = FALSE)
+  norm_degr_cent <- igraph::degree(dt_g, v = V(dt_g), mode = "all", normalized = TRUE)
+  # Compute the eigenvector centrality of our network
+  eign_cent <- igraph::eigen_centrality(dt_g, directed = TRUE)
+  eign_cent <- eign_cent$vector
+  # Compute the closeness centraility
+  clos_cent <- igraph::closeness(dt_g, normalized = FALSE)
+  norm_clos_cent <- igraph::closeness(dt_g, normalized = TRUE)
+  # Compute betweeness centrality
+  betw_cent <- igraph::betweenness(dt_g, directed = TRUE, normalized = FALSE)
+  norm_betw_cent <- igraph::betweenness(dt_g, directed = TRUE, normalized = TRUE)
+  all_centrality <- data.frame(vertex = names(V(dt_g)),
+                               degree = degr_cent, 
+                               norm_degree = norm_degr_cent,
+                               eigen = eign_cent, 
+                               closeness = clos_cent,
+                               norm_closeness = norm_clos_cent,
+                               betweeness = betw_cent,
+                               norm_betweeness = norm_betw_cent)
+  all_centrality$sample <- sample
+  all_centrality
+}
+parallel::stopCluster(cl = my.cluster)
+
+res <- bind_rows(res)
+saveRDS(res, file = "/home/data/sdb/wt/all_centrality.rds")
+```
+
+We retrieved the gene-wise vector of centrality measures of each sample sepcific enzyme network and computed the euclidean distance between these vectors of pairwise samples. 
+
+```{r eval=FALSE, include=TRUE}
+####基于（共有）节点重要性分布计算相似性
+res <- readRDS("/home/data/sdb/wt/all_centrality.rds")
+
+hypo_score <- data.table::fread("~/hypoxia_target/data/Pancancer hypoxia scores.txt",
+                                data.table = F)
+hypo_score_summ <- hypo_score %>% 
+  group_by(tumour_type) %>% 
+  summarise(up_quan = quantile(Buffa_hypoxia_score_intra_tumour_type)[4],
+            down_quan = quantile(Buffa_hypoxia_score_intra_tumour_type)[2]) %>% 
+  ungroup()
+hypo_score <- hypo_score %>% 
+  mutate(patient_id = gsub("[.]","-",patient_id)) %>% 
+  select(patient_id, tumour_type, Buffa_hypoxia_score_intra_tumour_type) %>% 
+  rename(score = Buffa_hypoxia_score_intra_tumour_type) %>% 
+  left_join(.,hypo_score_summ) %>% 
+  rowwise() %>% 
+  mutate(hypo_type = case_when(
+    score < down_quan ~ "no-hypo",
+    score > up_quan ~ "hypo",
+    TRUE ~ "others"
+  )) %>% ungroup()
+hypo_score <- hypo_score %>% filter(hypo_type != "others")
+hypo_score <- hypo_score %>% filter(hypo_type != "others")
+hypo_samples <- hypo_score$patient_id[which(hypo_score$hypo_type == "hypo")]
+no_hypo_samples <- hypo_score$patient_id[which(hypo_score$hypo_type == "no-hypo")]
+
+res <- res %>% filter(substr(sample,1,12) %in% hypo_score$patient_id)
+
+cal_sim <- function(dt, var){
+  dt_met <- dt %>%
+    select(vertex,sample,var) %>% 
+    tidyr::pivot_wider(names_from = sample, values_from = var) %>% 
+    as.data.frame()
+  rownames(dt_met) <- dt_met$vertex
+  dt_met$vertex <- NULL
+  dt_met <- t(dt_met)
+  dis <- dist(dt_met) %>% as.matrix()
+  return(dis)
+}
+
+bet_dis <- cal_sim(dt = res, var = "norm_betweeness")
+clo_dis <- cal_sim(dt = res, var = "norm_closeness")
+eig_dis <- cal_sim(dt = res, var = "eigen")
+deg_dis <- cal_sim(dt = res, var = "norm_degree")
+
+sim_res <- list(bet_dis = bet_dis, clo_dis = clo_dis,
+                eig_dis = eig_dis, deg_dis = deg_dis)
+saveRDS(sim_res, file = "/home/data/sdb/wt/met_net_dist.rds")
+
+```
+
+The the differences in this network distance between samples with the same hypoxia status and those with different hypoxia statuses were calculated.
+
+```{r}
+rm(list = ls())
+gc()
+
+hypo_score <- data.table::fread("~/hypoxia_target/data/Pancancer hypoxia scores.txt",
+                                data.table = F)
+hypo_score_summ <- hypo_score %>% 
+  group_by(tumour_type) %>% 
+  summarise(up_quan = quantile(Buffa_hypoxia_score_intra_tumour_type)[4],
+            down_quan = quantile(Buffa_hypoxia_score_intra_tumour_type)[2]) %>% 
+  ungroup()
+hypo_score <- hypo_score %>% 
+  mutate(patient_id = gsub("[.]","-",patient_id)) %>% 
+  select(patient_id, tumour_type, Buffa_hypoxia_score_intra_tumour_type) %>% 
+  rename(score = Buffa_hypoxia_score_intra_tumour_type) %>% 
+  left_join(.,hypo_score_summ) %>% 
+  rowwise() %>% 
+  mutate(hypo_type = case_when(
+    score < down_quan ~ "no-hypo",
+    score > up_quan ~ "hypo",
+    TRUE ~ "others"
+  )) %>% ungroup()
+hypo_score <- hypo_score %>% filter(hypo_type != "others")
+hypo_score <- hypo_score %>% filter(hypo_type != "others")
+hypo_samples <- hypo_score$patient_id[which(hypo_score$hypo_type == "hypo")]
+no_hypo_samples <- hypo_score$patient_id[which(hypo_score$hypo_type == "no-hypo")]
+
+####
+sim_res <- readRDS("/home/data/sdb/wt/met_net_dist.rds")
+bet_dis <- sim_res$bet_dis
+clo_dis <- sim_res$clo_dis
+eig_dis <- sim_res$eig_dis
+deg_dis <- sim_res$deg_dis
+
+get_sim <- function(sim_dt,hypo,nohypo){
+  sim_dt <- as.data.frame(sim_dt)
+  sim_dt$row_sample <- rownames(sim_dt)
+  sim_dt <- sim_dt %>% 
+    select(row_sample,everything())
+  sim_dt <- sim_dt %>% 
+    tidyr::pivot_longer(cols = 2:ncol(sim_dt), names_to = "col_sample",
+                        values_to = "sim")
+  dt <- data.frame(
+    ids = c(hypo,nohypo),
+    type = c(rep("hypo",length(hypo)),rep("nohypo",length(nohypo)))
+  )
+  sim_dt <- sim_dt %>% 
+    mutate(row_id = substr(row_sample,1,12),
+           col_id = substr(col_sample,1,12)) %>% 
+    left_join(.,
+              dt %>% rename(row_id = ids,row_type=type)) %>% 
+    left_join(.,dt %>% rename(col_id = ids,col_type=type))
+  
+  cancer_type <- data.frame(
+    ids = c(unique(sim_dt$row_id),unique(sim_dt$col_id))
+  ) %>% distinct_all()
+  cancer_type$cancer <- EasyBioinfo::get_cancer_type(cancer_type$ids)
+  
+  sim_dt <- sim_dt %>% 
+    left_join(.,
+              cancer_type %>% rename(row_id = ids,row_cancer=cancer)) %>% 
+    left_join(.,cancer_type %>% rename(col_id = ids,col_cancer=cancer))
+  
+  dt <- graph_from_data_frame(sim_dt %>% select(1,2),directed = F)
+  dt <- simplify(dt)
+  dt_unique <- as_data_frame(dt) %>% mutate(ids = paste0(from,"_",to))
+  
+  dt <- sim_dt %>% 
+    mutate(combid = paste0(row_sample,"_",col_sample)) %>% 
+    filter(combid %in% dt_unique$ids) %>% 
+    filter(row_cancer == col_cancer) %>% 
+    filter(row_id != col_id)
+  dt <- dt %>% 
+    mutate(type2 = ifelse(col_type != row_type,"Type2","Type1"))
+  return(dt)
+}
+
+bet_dt <- get_sim(bet_dis, hypo_samples, no_hypo_samples)
+clo_dt <- get_sim(clo_dis, hypo_samples, no_hypo_samples)
+eig_dt <- get_sim(eig_dis, hypo_samples, no_hypo_samples)
+deg_dt <- get_sim(deg_dis, hypo_samples, no_hypo_samples)
+
+p <- ggboxplot(bet_dt,x="type2",y="sim",xlab = F,
+               ylab = "Distance", title = "Betweeness")+
+  stat_compare_means(label="p.format")
+facet(p, facet.by = "row_cancer", nrow = 3)
+
+p <- ggboxplot(clo_dt,x="type2",y="sim",xlab = F,
+               ylab = "Distance", title = "Closeness")+
+  stat_compare_means(label="p.format")
+facet(p, facet.by = "row_cancer", nrow = 3)
+
+p <- ggboxplot(eig_dt,x="type2",y="sim",xlab = F,
+               ylab = "Distance", title = "Eigenvector")+
+  stat_compare_means(label="p.format")
+facet(p, facet.by = "row_cancer", nrow = 3)
+
+p <- ggboxplot(deg_dt,x="type2",y="sim",xlab = F,
+               ylab = "Distance", title = "Degree")+
+  stat_compare_means(label="p.format")
+facet(p, facet.by = "row_cancer", nrow = 3)
+```
+
+For each gene, we calculated the difference in the previously mentioned centrality metrics between hypoxic and non-hypoxic tumors.
+
+```{r eval=FALSE, include=TRUE}
+res <- readRDS("/home/data/sdb/wt/all_centrality.rds")
+hypo_score <- data.table::fread("data/Pancancer hypoxia scores.txt",data.table = F)
+hypo_score_summ <- hypo_score %>% 
+  group_by(tumour_type) %>% 
+  summarise(up_quan = quantile(Buffa_hypoxia_score_intra_tumour_type)[4],
+            down_quan = quantile(Buffa_hypoxia_score_intra_tumour_type)[2]) %>% 
+  ungroup()
+hypo_score <- hypo_score %>% 
+  mutate(patient_id = gsub("[.]","-",patient_id)) %>% 
+  select(patient_id, tumour_type, Buffa_hypoxia_score_intra_tumour_type) %>% 
+  rename(score = Buffa_hypoxia_score_intra_tumour_type) %>% 
+  left_join(.,hypo_score_summ) %>% 
+  rowwise() %>% 
+  mutate(hypo_type = case_when(
+    score < down_quan ~ "no-hypo",
+    score > up_quan ~ "hypo",
+    TRUE ~ "others"
+  )) %>% ungroup()
+hypo_score <- hypo_score %>% filter(hypo_type != "others")
+
+res <- res %>% 
+  filter(substr(sample,1,12) %in% hypo_score$patient_id)
+res <- res %>% 
+  mutate(patient_id = substr(sample, 1, 12)) %>% 
+  left_join(.,
+            hypo_score %>% select(patient_id,hypo_type))
+gene_summ <- res %>% group_by(vertex) %>% 
+  summarise(counts = length(unique(hypo_type))) %>% ungroup() %>% 
+  filter(counts > 1)
+res <- res %>% 
+  filter(vertex %in% gene_summ$vertex)
+
+##
+all_genes <- unique(res$vertex)
+diff_res <- vector("list",length(all_genes))
+for (i in 1:length(diff_res)){
+  dt <- res %>% filter(vertex == all_genes[i])
+  metrics <- colnames(dt)[2:8]
+  dt_res <- data.frame(
+    metrics = metrics,
+    p_value = NA,
+    diff = NA
+  )
+  for (j in 1:nrow(dt_res)){
+    tmp <- dt %>% select(dt_res$metrics[j], hypo_type) %>% na.omit()
+    if (nrow(tmp) < 2){
+      dt_res$p_value[j] <- NA
+      dt_res$diff[j] <- NA
+    }else{
+      dt_tmp <- wilcox.test(get(dt_res$metrics[j]) ~ hypo_type, data = dt)
+      dt_res$p_value[j] <- dt_tmp$p.value
+      dt_res$diff[j] <- median(dt[,dt_res$metrics[j]][which(dt$hypo_type == "hypo")],na.rm = T) - median(dt[,dt_res$metrics[j]][which(dt$hypo_type == "no-hypo")],na.rm = T)
+    }
+  }
+  dt_res$padj <- p.adjust(dt_res$p_value, method = "fdr")
+  dt_res$gene <- all_genes[i]
+  diff_res[[i]] <- dt_res
+  message("Complete ",i,"\n")
+}
+diff_res <- bind_rows(diff_res)
+saveRDS(diff_res, file = "~/hypoxia_target/data/hypo_gene_net_diff.rds")
+```
+
+We defined a  gene as having a significant difference if it had an FDR value less than  0.05 (Wilcoxon rank-sum test) and the median of the centrality metric in hypoxic tumor samples was greater than in non-hypoxic tumor samples. We filtered for genes with at least one significantly up regulated centrality metric in hypoxic state and used these genes to perform over representation enrichment analysis of metabolic pathways.
+
+```{r}
+rm(list = ls())
+gc()
+
+diff_res <- readRDS("~/hypoxia_target/data/hypo_gene_net_diff.rds")
+diff_res_sig <- diff_res %>% 
+  filter(metrics %in% c("norm_betweeness","norm_closeness","eigen","norm_degree")) %>% 
+  group_by(gene) %>% 
+  summarise(sig_counts = sum(diff > 0 & padj < 0.05)) %>% 
+  ungroup() %>% filter(sig_counts >= 1) ##只要有一个显著
+
+sig_genes <- unique(diff_res_sig$gene)
+trans <- genekitr::transId(sig_genes,"symbol")
+trans <- trans[!duplicated(trans$input_id),]
+diff_res_sig <- inner_join(
+  diff_res_sig,
+  trans %>% rename(gene = input_id)
+)
+
+kegg <- readRDS("~/meta_target/data/kegg_all_pathway.rds")
+kegg <- kegg %>% 
+  select(pathway,genes)
+colnames(kegg) <- c("gs_name","input_id")
+enz_id <- genekitr::transId(unique(kegg$input_id), transTo = "entrez")
+kegg <- left_join(kegg,enz_id)
+kegg <- kegg %>% 
+  select(gs_name,entrezid) %>% rename(entrez_gene = entrezid)
+
+enz_id <- genekitr::transId(unique(diff_res_sig$symbol), transTo = "entrez")
+em <- clusterProfiler::enricher(enz_id$entrezid, TERM2GENE=kegg,
+                                pvalueCutoff = 1, qvalueCutoff =1) ##use all gene as background
+em_res <- em %>% as.data.frame()
+
+kegg <- readRDS("~/meta_target/data/kegg_all_pathway.rds")
+kegg <- kegg %>%
+  filter(grepl("Metabolism",class) | grepl("metabolism",pathway)) %>%
+  mutate(pathway = gsub(" \\- Homo sapiens \\(human\\)","",pathway))
+em_res <- em_res %>% 
+  mutate(pathway = gsub(" -.+","",ID)) %>% 
+  filter(pathway %in% kegg$pathway) 
+
+library(enrichplot)
+library(ggplot2)
+em <- filter(em, ID %in% em_res$ID)
+em@result$Description <- gsub(" -.+","",em@result$Description)
+barplot(em, showCategory=15) +
+  scale_y_discrete(labels=function(x) stringr::str_wrap(x, width=40))
+```
+
+
+
+

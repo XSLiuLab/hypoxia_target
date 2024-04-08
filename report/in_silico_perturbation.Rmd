@@ -1,0 +1,292 @@
+---
+title: "In silico perturbation"
+author: "Tao Wu"
+date: "`r Sys.Date()`"
+output:   
+  rmdformats::readthedown:
+    highlight: kate
+    lightbox: false
+    toc_depth: 3
+    mathjax: true
+---
+
+```{r tcga_analysis-setup, include=FALSE}
+options(max.print = "75")
+knitr::opts_chunk$set(echo = TRUE, comment = "#>", eval = TRUE, collapse = TRUE,cache = FALSE)
+knitr::opts_knit$set(width = 75)
+```
+
+```{r}
+library(dplyr)
+```
+
+The idea is to use the activity of cell death-related gene sets to divide cells into dying cells and non-dying cells based on single-cell data, and then fine-tune the GeneFormer, which is a foundation transformer model pretrained on a large-scale corpus of ~30 million single cell transcriptomes to enable context-aware predictions in settings with limited data in network biology, to  predict cell dying state. We then determined the genes whose in silico deletion in hypoxic cells or non-hypoxic cells from non-dying cell state significantly shifted the fine- tuned Geneformer cell embeddings towards the dying cell states:
+
+![](https://picgo-wutao.oss-cn-shanghai.aliyuncs.com/undefinedhypoxia_00.png)
+
+The raw expression counts matrix for lung cancer single-cell data was  downloaded from the corresponding study and processed using the R  package Seurat. To only retain high-quality data, we removed all cells  that have fewer than 250 genes with mapped reads and contain more than 15% of mitochondrial specific reads. Then, we used TCfinder to predict  cancer cells and retained only the cancer cells for downstream analysis.
+
+```{r eval=FALSE, include=TRUE}
+library(Seurat)
+lung <- readRDS("/home/data/sdb/wt/lung_cancer/RNA_rawcounts_matrix.rds")
+
+###remove cell with high MT 
+scRNA_obj <- CreateSeuratObject(counts=lung)
+scRNA_obj[["percent_mt"]] <- PercentageFeatureSet(scRNA_obj, 
+                                                  pattern = "^Mt\\.|^MT\\.|^mt\\.|^Mt-|^MT-|^mt-")
+scRNA_obj <- subset(scRNA_obj, 
+                    subset = nFeature_RNA > 250 & percent_mt < 15)
+##cancer cell pre
+lung <- GetAssayData(scRNA_obj, assay="RNA", slot = "counts")
+ps <- TCfinder::pathway_score(expr_data = lung,
+                              normalized = FALSE)
+rownames(ps) <- colnames(lung)
+res <- callr::r(func = function(conda_env, ps){
+  reticulate::use_python(paste0(conda_env,"/bin/python"))
+  predict_result <- TCfinder::predict_cell(path_score = ps)
+  return(predict_result)
+},args = list(conda_env = "/home/wt/miniconda3/envs/tcfinder/", 
+              ps = ps))
+
+########
+tumor_cells <- res$barcode[which(res$cell_type == "tumor")] 
+tumor <- lung[,tumor_cells]
+saveRDS(tumor,file = "/home/data/sdb/wt/lung_cancer/lung_tumor_cell.rds")
+
+###test
+exp <- ReadMtx(
+  mtx = "/home/data/sdc/wt/single_cell/raw_counts/cell_research_2020/lung/LC_counts/matrix.mtx", 
+  features = "/home/data/sdc/wt/single_cell/raw_counts/cell_research_2020/lung/LC_counts/genes.tsv",
+  cells = "/home/data/sdc/wt/single_cell/raw_counts/cell_research_2020/lung/LC_counts/barcodes.tsv"
+)
+
+###remove cell with high MT 
+scRNA_obj <- CreateSeuratObject(counts=exp)
+scRNA_obj[["percent_mt"]] <- PercentageFeatureSet(scRNA_obj, 
+                                                  pattern = "^Mt\\.|^MT\\.|^mt\\.|^Mt-|^MT-|^mt-")
+scRNA_obj <- subset(scRNA_obj, 
+                    subset = nFeature_RNA > 250 & percent_mt < 15)
+
+###find cancer cell
+lung <- GetAssayData(scRNA_obj, assay="RNA", slot = "counts")
+ps <- TCfinder::pathway_score(expr_data = exp,
+                              normalized = FALSE)
+rownames(ps) <- colnames(exp)
+res <- callr::r(func = function(conda_env, ps){
+  reticulate::use_python(paste0(conda_env,"/bin/python"))
+  predict_result <- TCfinder::predict_cell(path_score = ps)
+  return(predict_result)
+},args = list(conda_env = "/home/wt/miniconda3/envs/tcfinder/", 
+              ps = ps))
+
+tumor_cells <- res$barcode[which(res$cell_type == "tumor")] 
+tumor <- exp[,tumor_cells]
+
+saveRDS(tumor,file = "/home/data/sdb/wt/lung_cancer/lung_tumor_cell_test.rds")
+```
+
+AUCell was used to calculate activity score of hypoxia gene set and cell death related gene set for each cell. Gaussian mixture model (GMM) was used to assign cells into high- and low-score group based on cells' activity scores.
+
+```{r eval=FALSE, include=TRUE}
+library(AUCell)
+
+lung_tumor <- readRDS("/home/data/sdb/wt/lung_cancer/lung_tumor_cell.rds")
+hypo_pathway <- fgsea::gmtPathways("~/CHPF/exmaple/Hypoxia_geneset.gmt")
+all_hypo_genes <- hypo_pathway %>% unlist() %>% unname() 
+all_hypo_genes <- list(
+  hypo_sig = all_hypo_genes
+)
+cells_AUC <- AUCell_run(lung_tumor, all_hypo_genes)
+
+cells_assignment <- AUCell_exploreThresholds(cells_AUC,
+                                             plotHist=TRUE, assign=TRUE)
+auc_score <- getAUC(cells_AUC) %>% t() %>% as.data.frame()
+
+###
+#GMM clustering 
+fit_GMM <- Mclust(auc_score[,1], G = 2)
+Cluster <- list(fit_GMM["classification"])
+auc_score$cell <- rownames(auc_score)
+auc_score$cluster <- Cluster[[1]][[1]]
+saveRDS(auc_score, file = "~/hypoxia_target/data/auc_hypo_cluster.rds")
+
+###death
+lung_tumor <- readRDS("/home/data/sdb/wt/lung_cancer/lung_tumor_cell.rds")
+pcd_pathway <- fgsea::gmtPathways("data/pcd_pathway.gmt")
+all_pcd_genes <- pcd_pathway %>% unlist() %>% unname() 
+all_pcd_genes <- list(
+  pcd_sig = all_pcd_genes
+)
+cells_AUC <- AUCell_run(lung_tumor, all_pcd_genes)
+
+cells_assignment <- AUCell_exploreThresholds(cells_AUC,
+                                             plotHist=TRUE, assign=TRUE)
+auc_score <- getAUC(cells_AUC) %>% t() %>% as.data.frame()
+
+#GMM clustering 
+fit_GMM <- Mclust(auc_score[,1], G = 2)
+Cluster <- list(fit_GMM["classification"])
+auc_score$cell <- rownames(auc_score)
+auc_score$cluster <- Cluster[[1]][[1]]
+saveRDS(auc_score, file = "~/hypoxia_target/data/auc_pcd_cluster.rds")
+```
+
+For GeneFormer fine-tuning, the data was saved as `loom` format:
+
+```{r}
+lung_tumor <- readRDS("/home/data/sdb/wt/lung_cancer/lung_tumor_cell.rds")
+###id 转化
+id <- rownames(lung_tumor)
+ems_id <- genekitr::transId(id, transTo = "ens")
+ems_id <- ems_id[!duplicated(ems_id$input_id),]
+ems_id <- ems_id[!duplicated(ems_id$ensembl),]
+lung_tumor <- lung_tumor[ems_id$input_id,]
+rownames(lung_tumor) <- ems_id$ensembl
+
+auc_pcd_cluster <- readRDS("~/hypoxia_target/data/auc_pcd_cluster.rds")
+auc_hypo_cluster <- readRDS("~/hypoxia_target/data/auc_hypo_cluster.rds")
+
+library(ggpubr)
+ggboxplot(auc_pcd_cluster,x="cluster",y="pcd_sig")
+ggboxplot(auc_hypo_cluster,x="cluster",y="hypo_sig")
+```
+
+The data from K.H. et al was used as training data, and 30% of the training data was applied to monitor training process and tune hyper-parameters.
+
+```{r eval=FALSE, include=TRUE}
+auc_pcd_cluster <- auc_pcd_cluster %>% 
+  mutate(pcd_type = ifelse(cluster == 2, "pcd","no_pcd")) %>% 
+  select(cell, pcd_type)
+auc_hypo_cluster <- auc_hypo_cluster %>% 
+  mutate(hypo_type = ifelse(cluster == 2, "hypo","no_hypo")) %>% 
+  select(cell, hypo_type)
+
+library(Seurat,lib.loc = "~/seuratV4/")
+
+meta <- data.frame(
+  cell = colnames(lung_tumor)
+) %>% inner_join(.,auc_pcd_cluster) %>% 
+  inner_join(.,auc_hypo_cluster)
+
+all_pcd_obj <- CreateSeuratObject(counts = lung_tumor)
+meta1 <- all_pcd_obj@meta.data
+meta1$orig.ident <- rownames(meta1)
+meta1 <- left_join(
+  meta1, meta %>% rename(orig.ident = cell)
+) %>% rename(cell_state_hypo = hypo_type,
+             cell_state_pcd = pcd_type) %>% as.data.frame()
+rownames(meta1) <- meta1$orig.ident
+
+all_pcd_obj@meta.data <- meta1
+###抽样训练集和测试集
+set.seed(202403211)
+pcd_idx <- rep("Test",ncol(all_pcd_obj))
+pcd_idx[sample(1:length(pcd_idx),length(pcd_idx)*0.7,replace = FALSE)] <- "Train"
+
+all_pcd_obj$train_test <- pcd_idx
+
+library(SeuratDisk)
+SaveLoom(all_pcd_obj,
+         filename = "/home/data/sdb/wt/pcd_obj.loom",
+         gene_col_name = "ensembl_id",
+         overwrite = TRUE)
+
+library(loomR)
+lfile <- loomR::connect(filename = "/home/data/sdb/wt/pcd_obj.loom", 
+                        mode = "r+",skip.validate = T)
+lfile$add.col.attribute(list(n_counts = lfile$col.attrs$nCount_RNA[]), 
+                        overwrite = TRUE)
+lfile$add.col.attribute(list(individual = 1:ncol(all_pcd_obj)), 
+                        overwrite = TRUE)
+lfile[["row_attrs"]]
+lfile[["col_attrs"]]
+lfile$close_all()
+```
+
+The hyperparameter tuning process is implemented by the Ray Tune framework and used AUC score as evaluation metric. After hyper-parameter tuning, we set following hyper-parameters: 3.152009e-04 for learning rate, cosine for learning rate scheduler, 635.01 for warmup steps, 0.279 for weight decay and 24 for batch size. The Fine-tuned model were independently validated on data sets from Qian, J. et al. The code for data creation, fine-tuning, training and validation can be found in `script/dataset.ipynb`, `script/fine_tuning.ipynb`, `script/gene_former.ipynb`.
+
+In order to do in silico perturb, we merge the training set and test set to increase the sample size:
+
+```{r eval=FALSE, include=TRUE}
+library(AUCell)
+library(mclust)
+cal_score <- function(exp_path,pathway_path){
+  tumor_exp <- readRDS(exp_path)
+  pathway <- fgsea::gmtPathways(pathway_path)
+  all_genes <- pathway %>% unlist() %>% unname() 
+  all_genes <- list(
+    sig = all_genes
+  )
+  cells_AUC <- AUCell_run(tumor_exp, all_genes)
+  auc_score <- getAUC(cells_AUC) %>% t() %>% as.data.frame()
+  fit_GMM <- Mclust(auc_score[,1], G = 2)
+  Cluster <- list(fit_GMM["classification"])
+  auc_score$cell <- rownames(auc_score)
+  auc_score$cluster <- Cluster[[1]][[1]]
+  return(auc_score)
+}
+##hypo
+hypo_score <- cal_score(exp_path = "/home/data/sdb/wt/lung_cancer/lung_tumor_cell_test.rds",
+                        pathway_path = "~/CHPF/exmaple/Hypoxia_geneset.gmt")
+saveRDS(hypo_score,file = "~/hypoxia_target/data/hypo_score_test.rds")
+
+##death
+death_score <- cal_score(exp_path = "/home/data/sdb/wt/lung_cancer/lung_tumor_cell_test.rds",
+                          pathway_path = "~/hypoxia_target/data/pcd_pathway.gmt")
+saveRDS(death_score,file = "~/hypoxia_target/data/pcd_score_test.rds")
+
+##combine train and test data
+lung_tumor <- readRDS("/home/data/sdb/wt/lung_cancer/lung_tumor_cell_test.rds")
+###id 转化
+id <- rownames(lung_tumor)
+ems_id <- genekitr::transId(id, transTo = "ens")
+ems_id <- ems_id[!duplicated(ems_id$input_id),]
+ems_id <- ems_id[!duplicated(ems_id$ensembl),]
+lung_tumor <- lung_tumor[ems_id$input_id,]
+rownames(lung_tumor) <- ems_id$ensembl
+
+auc_pcd_cluster <- readRDS("~/hypoxia_target/data/pcd_score_test.rds")
+auc_hypo_cluster <- readRDS("~/hypoxia_target/data/hypo_score_test.rds")
+auc_pcd_cluster <- auc_pcd_cluster %>% 
+  mutate(pcd_type = ifelse(cluster == 2, "pcd","no_pcd")) %>% 
+  select(cell, pcd_type)
+auc_hypo_cluster <- auc_hypo_cluster %>% 
+  mutate(hypo_type = ifelse(cluster == 2, "hypo","no_hypo")) %>% 
+  select(cell, hypo_type)
+meta <- data.frame(
+  cell = colnames(lung_tumor)
+) %>% inner_join(.,auc_pcd_cluster) %>% 
+  inner_join(.,auc_hypo_cluster)
+
+all_pcd_obj_test <- CreateSeuratObject(counts = lung_tumor)
+meta1 <- all_pcd_obj_test@meta.data
+meta1$orig.ident <- rownames(meta1)
+meta1 <- left_join(
+  meta1, meta %>% rename(orig.ident = cell)
+) %>% rename(cell_state_hypo = hypo_type,
+             cell_state_pcd = pcd_type) %>% as.data.frame()
+rownames(meta1) <- meta1$orig.ident
+
+all_pcd_obj_test@meta.data <- meta1
+###
+combined <- merge(all_pcd_obj,all_pcd_obj_test)
+library(SeuratDisk)
+SaveLoom(combined,
+         filename = "/home/data/sdb/wt/pcd_obj_comb.loom",
+         gene_col_name = "ensembl_id",
+         overwrite = TRUE)
+
+lfile <- loomR::connect(filename = "/home/data/sdb/wt/pcd_obj_comb.loom", 
+                        mode = "r+",skip.validate = T)
+lfile$add.col.attribute(list(n_counts = lfile$col.attrs$nCount_RNA[]), 
+                        overwrite = TRUE)
+lfile$add.col.attribute(list(individual = 1:ncol(combined)), 
+                        overwrite = TRUE)
+lfile[["row_attrs"]]
+lfile[["col_attrs"]]
+lfile$close_all()
+```
+
+
+
+
