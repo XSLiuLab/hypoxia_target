@@ -10,13 +10,13 @@ output:
     mathjax: true
 ---
 
-```{r tcga_analysis-setup, include=FALSE}
+```{r In_silico_perturbation-setup, include=FALSE}
 options(max.print = "75")
 knitr::opts_chunk$set(echo = TRUE, comment = "#>", eval = TRUE, collapse = TRUE,cache = FALSE)
 knitr::opts_knit$set(width = 75)
 ```
 
-```{r}
+```{r include=FALSE}
 library(dplyr)
 ```
 
@@ -205,6 +205,41 @@ lfile$close_all()
 
 The hyperparameter tuning process is implemented by the Ray Tune framework and used AUC score as evaluation metric. After hyper-parameter tuning, we set following hyper-parameters: 3.152009e-04 for learning rate, cosine for learning rate scheduler, 635.01 for warmup steps, 0.279 for weight decay and 24 for batch size. The Fine-tuned model were independently validated on data sets from Qian, J. et al. The code for data creation, fine-tuning, training and validation can be found in `script/dataset.ipynb`, `script/fine_tuning.ipynb`, `script/gene_former.ipynb`.
 
+```{r}
+pre <- data.table::fread("~/hypoxia_target/data/geneformer_preds.csv",
+                         data.table = F) %>% 
+  select(-V1)
+pre <- pre %>% 
+  mutate(predictions = gsub("\\[|\\]","",predictions)) %>% 
+  tidyr::separate_wider_delim(cols = predictions,delim = ", ",
+                              names = c("pre1","pre2")) %>% 
+  mutate(pre1 = as.numeric(pre1),
+         pre2 = as.numeric(pre2))
+
+library(yardstick)
+pre <- pre %>% 
+  mutate(truth = ifelse(label_ids == 0, "Class1","Class2"),
+         predicted = ifelse(pred_ids == 0, "Class1","Class2")) %>% 
+  rename(Class1 = pre1,
+         Class2 = pre2)
+pre$truth <- factor(pre$truth)
+
+pr <-  pr_auc(pre, truth, Class1)[".estimate"] %>% 
+  unlist() %>% unname() %>% round(.,2)
+roc <-  roc_auc(pre, truth, Class1)[".estimate"] %>% 
+  unlist() %>% unname() %>% round(.,2)
+
+p1 <- roc_curve(pre, truth, Class1) %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity)) +
+  geom_path() +
+  coord_fixed(xlim = 0:1, ylim = 0:1) +
+  theme_bw() +
+  annotate(geom="text", x=0.75, y=0.7, label=paste0("ROC-AUC: ",roc),
+           size=5)
+p1
+
+```
+
 In order to do in silico perturb, we merge the training set and test set to increase the sample size:
 
 ```{r eval=FALSE, include=TRUE}
@@ -287,6 +322,429 @@ lfile[["col_attrs"]]
 lfile$close_all()
 ```
 
+In silico perturbation was achieved by removing the given gene from the rank value encoding of the given single-cell transcriptome and quantifying the cosine similarity between the original and perturbed cell embeddings to determine the predicted deleterious impact of deleting that gene in that cell. This impact was compared with the random distribution drawn from the other genes to calculate p value and corresponding FDR. The code for perturbation can be found in `script/in_silico_perturbation.ipynb`. 
+
+We first performed in silico perturbation on all single cells, identified genes whose deletion could significantly shift cells from the non-dying state to the dying state, and compared these genes with the dependent genes obtained by CRIPSR.
+
+```{r}
+res <- data.table::fread("~/hypoxia_target/data/all_pcd_res_all_cell.csv",
+                         data.table = F)
+res <- res %>% 
+  mutate(type = ifelse(Shift_to_goal_end > 0 & Goal_end_FDR < 0.0001,
+                       "Hit","Not-Hit"))
+
+cell_info <- read.csv("/home/data/sdb/wt/Model_2023Q4.csv")
+cell_info <- cell_info %>%
+  filter((OncotreeLineage != "Normal") & (OncotreePrimaryDisease != "Non-Cancerous"))
+lung_cell <- cell_info %>% filter(OncotreeLineage == "Lung") %>% 
+  filter(OncotreeSubtype %in% c("Lung Adenocarcinoma","Non-Small Cell Lung Cancer",
+                                "Lung Squamous Cell Carcinoma",
+                                "Lung Adenosquamous Carcinoma"))
+dep_dt <- data.table::fread("/home/data/sdb/wt/CRISPRGeneDependency_2023Q4.csv",
+                            data.table = F)
+colnames(dep_dt)[2:ncol(dep_dt)] <- gsub("\\s*\\([^\\)]+\\)","",
+                                         colnames(dep_dt)[2:ncol(dep_dt)])
+dep_dt <- dep_dt %>% 
+  tidyr::pivot_longer(cols = colnames(dep_dt)[2:ncol(dep_dt)],names_to = "gene",
+                      values_to = "score")
+lung_dep <- dep_dt %>% filter(V1 %in% lung_cell$ModelID) %>% 
+  filter(!is.na(score))
+
+dt <- lung_dep %>% filter(gene %in% res$Gene_name)
+dt <- inner_join(dt, res %>% rename(gene = Gene_name) %>% select(gene, type))
+dt_summ <- dt %>% group_by(gene) %>% 
+  summarise(pos_cell = sum(score > 0.8),
+            type = unique(type)) %>% ungroup()
+dt_summ <- dt_summ %>% mutate(depmap_type = case_when(
+  pos_cell > 20 ~ "yes",
+  TRUE ~ "no"
+))
+
+###
+library(ggprism)
+library(ggplot2)
+
+df <- dt_summ %>% 
+  group_by(depmap_type,type) %>% 
+  summarise(gene_counts = length(unique(gene))) %>% 
+  ungroup() %>% 
+  mutate(type = ifelse(type == "Hit","In Silico Perturbation Hit",
+                       "In Silico Perturbation Not Hit"))
+table(dt_summ$type,dt_summ$depmap_type) %>% chisq.test()
+ggplot(data=df,aes(x=depmap_type,y=gene_counts,fill=type))+
+  geom_bar(stat = "identity",position="fill")+
+  theme_prism()+
+  labs(y="Percent of cases (%)",title = "Chi-squared test, P < 2.2e-16")+
+  scale_fill_manual(values=c("#FE0000","#00FDFE"))+
+  scale_x_discrete(labels=c("CRIPSR Not Hit","CRIPSR Hit"))+
+  theme(axis.title.x = element_blank())
+
+ggplot(data=dt_summ, aes(x=pos_cell, group=type, fill=type)) +
+  geom_density(adjust=1.5, alpha=.4) +
+  theme_prism()+
+  labs(x="Counts of CRPSPR Positive Cell",y="Density")
+```
+
+We filtered the results of in silico perturbation by the following criteria: 1. Only retain metabolism-related genes (KEGG)，2. The effect value obtained by delete the gene under hypoxia state was > 0, and the FDR was < 0.05 (the effect value refers to the magnitude of cell embedding shift from the non-dying state to the dying state after delete the specific gene), 3. Fold change (absolute value) of the effect size between hypoxic and non-hypoxic state was > 1, 4. Based on TCGA data, fold change of mRNA expression between hypoxic and non-hypoxic tumors was > 1 and corresponding FDR was < 0.05.
+
+```{r eval=FALSE, include=TRUE}
+hypo_res <- data.table::fread("~/hypoxia_target/data/0331_pcd_hypo_res.csv",
+                              data.table = F)
+no_hypo_res <- data.table::fread("~/hypoxia_target/data/0331pcd_no_hypo_res.csv",
+                                 data.table = F)
+all_res <- inner_join(
+  hypo_res %>% select(Gene_name,Shift_to_goal_end,Goal_end_vs_random_pval,
+                      Goal_end_FDR) %>% 
+    filter(nchar(Gene_name) > 0),
+  no_hypo_res %>% select(Gene_name,Shift_to_goal_end) %>% 
+    rename(Shift_no_hypo = Shift_to_goal_end) %>% 
+    filter(nchar(Gene_name) > 0)
+) %>% 
+  mutate(fc = Shift_to_goal_end/Shift_no_hypo)
+
+kegg_all_pathway <- readRDS("~/meta_target/data/kegg_all_pathway.rds")
+kegg_all_pathway <- kegg_all_pathway %>% 
+  filter(grepl("Metabolism",class) | grepl("metabolism",pathway)) %>% 
+  mutate(pathway = gsub(" \\- Homo sapiens \\(human\\)","",pathway))
+kegg_genes <- unique(kegg_all_pathway$genes)
+
+all_res_meta <- all_res %>% 
+  filter(Gene_name %in% kegg_genes) %>% 
+  filter(Shift_to_goal_end > 0 & Goal_end_FDR < 0.05) %>% 
+  mutate(abs_fc = abs(fc)) %>% 
+  arrange(Goal_end_FDR, desc(abs_fc)) %>% 
+  mutate(stat= (-log10(Goal_end_FDR)) * abs_fc) %>% 
+  arrange(desc(stat))
+saveRDS(all_res_meta,file = "~/hypoxia_target/data/all_res_meta0331.rds")
+
+#####分析这些基因的表达
+all_res_meta <- all_res_meta %>% 
+  filter(abs_fc > 1)
+ems_id <- genekitr::transId(all_res_meta$Gene_name, transTo = "ens")
+all_res_meta <- left_join(
+  all_res_meta,
+  ems_id %>% rename(Gene_name = input_id)
+)
+mapping <- data.table::fread("/home/data/sdb/wt/gencode.v22.annotation.gene.probeMap",data.table = F)
+mapping <- mapping %>% 
+  filter(gsub("[.].+","",id) %in% ems_id$ensembl)
+all_res_meta <- left_join(
+  all_res_meta,
+  mapping %>% select(gene,id) %>% 
+    mutate(id2 = gsub("[.].+","",id)) %>% 
+    rename(ensembl = id2)
+)
+all_res_meta <- all_res_meta %>% 
+  filter(!is.na(id))
+dup_gene <- all_res_meta %>% 
+  group_by(Gene_name) %>% 
+  summarise(counts = n()) %>% ungroup() %>% filter(counts > 1)
+all_res_meta <- all_res_meta %>% 
+  filter(!(Gene_name %in% dup_gene$Gene_name) | ((Gene_name %in% dup_gene$Gene_name) & (Gene_name == gene)))
+
+luad <- data.table::fread("/home/data/sdb/wt/TCGA-LUAD.htseq_fpkm-uq.tsv.gz",
+                          data.table = F)
+luad <- luad %>% filter(Ensembl_ID %in% all_res_meta$id)
+rownames(luad) <- luad$Ensembl_ID
+luad$Ensembl_ID <- NULL
+lusc <- data.table::fread("/home/data/sdb/wt/TCGA-LUSC.htseq_fpkm-uq.tsv.gz",
+                          data.table = F)
+lusc <- lusc %>% filter(Ensembl_ID %in% all_res_meta$id)
+rownames(lusc) <- lusc$Ensembl_ID
+lusc$Ensembl_ID <- NULL
+
+all_samples <- c(colnames(luad),colnames(lusc))
+all_cancers <- all_samples[as.numeric(substr(all_samples,14,15)) < 11] %>% na.omit()
+
+all_cancer_exp <- bind_cols(luad,lusc)
+all_cancer_exp <- all_cancer_exp[,all_cancers]
+all_cancer_exp <- t(all_cancer_exp) %>% as.data.frame()
+all_cancer_exp <- apply(all_cancer_exp,2,function(x){(2^x)-1}) %>% as.data.frame()
+
+hypo_score <- data.table::fread("data/Pancancer hypoxia scores.txt",data.table = F)
+hypo_score <- hypo_score %>% 
+  mutate(patient_id = gsub("[.]","-",patient_id)) %>% 
+  filter(tumour_type %in% c("LUAD","LUSC")) %>% 
+  select(patient_id, tumour_type, Buffa_hypoxia_score_intra_tumour_type) %>% 
+  mutate(type = case_when(
+    tumour_type == "LUAD" & Buffa_hypoxia_score_intra_tumour_type > 21 ~ "hypo",
+    tumour_type == "LUAD" & Buffa_hypoxia_score_intra_tumour_type < (-21) ~ "normal",
+    tumour_type == "LUSC" & Buffa_hypoxia_score_intra_tumour_type > 15 ~ "hypo",
+    tumour_type == "LUSC" & Buffa_hypoxia_score_intra_tumour_type < (-13) ~ "normal",
+    TRUE ~ "others"
+  ))
+all_cancer_exp$sample <- substr(rownames(all_cancer_exp),1,12)
+all_cancer_exp <- left_join(
+  all_cancer_exp,
+  hypo_score %>% rename(sample = patient_id) %>% select(sample,type)
+)
+all_cancer_exp <- all_cancer_exp %>% select(sample,type,everything())
+all_cancer_exp <- all_cancer_exp %>% filter(type != "others")
+diff_res <- data.frame(ids = colnames(all_cancer_exp)[3:ncol(all_cancer_exp)],
+                       exp_fc = NA, p_value = NA)
+for (i in 1:nrow(diff_res)){
+  dt <- all_cancer_exp %>% 
+    select(type,diff_res$ids[i]) %>% 
+    rename(exp = 2)
+  dt$type <- factor(dt$type,levels = c("hypo","normal"))
+  dt_res <- wilcox.test(exp ~ type, data=dt)
+  diff_res$exp_fc[i] <- mean(dt$exp[dt$type == "hypo"]) / mean(dt$exp[dt$type == "normal"])
+  diff_res$p_value[i] <- dt_res$p.value
+}
+
+all_res_meta <- left_join(
+  all_res_meta,
+  diff_res %>% rename(id = ids)
+)
+all_res_meta$exp_diff_fdr <- p.adjust(all_res_meta$p_value,"fdr")
+
+saveRDS(all_res_meta, file = "~/hypoxia_target/data/filter_target0331.rds")
+```
+
+For each gene we define differential expression statistics and perturbation statistics：Differential Expression Stat = (-log10(Exp-FDR)) * Exp_FC; Perturbation Stat = (-log10(Perturbation-FDR)) * Abs_FC, and sort the genes according to these two statistics.
+
+```{r}
+all_res_meta <- readRDS("~/hypoxia_target/data/filter_target0331.rds")
+tt <- all_res_meta %>% 
+  filter(exp_diff_fdr < 0.05 & exp_fc > 1) %>% 
+  mutate(pertur_pre_stat = (-log10(Goal_end_FDR)) * abs_fc) %>% 
+  mutate(exp_pre_stat = (-log10(exp_diff_fdr)) * exp_fc) %>% 
+  mutate(pertur_stat = log10(pertur_pre_stat),
+         exp_stat = log10(exp_pre_stat)) %>% 
+  arrange(desc(pertur_stat),desc(exp_stat))
+
+library(ggtext)
+dt <- tt %>% select(Gene_name,exp_stat,pertur_stat) %>% 
+  rename(`Differential Expression Stat`=exp_stat,
+         `Perturbation Stat`=pertur_stat) %>% 
+  tidyr::pivot_longer(cols = c("Differential Expression Stat",
+                               "Perturbation Stat"),
+                      names_to = "Score Type",values_to = "score")
+ggbarplot(dt,x="Gene_name",y="score",fill = "Score Type",
+          position = position_dodge(0.9),xlab = F,ylab = "log10(Score)",
+          lab.size = 2) +
+  theme(axis.text.x = element_markdown(angle = 90, vjust = 0.5, hjust = 1))
+```
+
+Finally, we obtained 110 metabolic genes that met the criterias. We performed metabolic pathway over representation enrichment analysis on these genes and found that the most significantly enriched metabolic pathway was oxidative phosphorylation.
+
+```{r}
+kegg <- readRDS("~/meta_target/data/kegg_all_pathway.rds")
+kegg <- kegg %>% 
+  select(pathway,genes)
+colnames(kegg) <- c("gs_name","input_id")
+enz_id <- genekitr::transId(unique(kegg$input_id), transTo = "entrez")
+kegg <- left_join(kegg,enz_id)
+kegg <- kegg %>% 
+  select(gs_name,entrezid) %>% rename(entrez_gene = entrezid)
+
+enz_id <- genekitr::transId(unique(tt$Gene_name), transTo = "entrez")
+em <- clusterProfiler::enricher(enz_id$entrezid, TERM2GENE=kegg,
+                                pvalueCutoff = 1, qvalueCutoff =1)##use all gene as background
+em_res <- em %>% as.data.frame()
+
+kegg <- readRDS("~/meta_target/data/kegg_all_pathway.rds")
+kegg <- kegg %>%
+  filter(grepl("Metabolism",class) | grepl("metabolism",pathway)) %>%
+  mutate(pathway = gsub(" \\- Homo sapiens \\(human\\)","",pathway))
+em_res <- em_res %>% 
+  mutate(pathway = gsub(" -.+","",ID)) %>% 
+  filter(pathway %in% kegg$pathway) %>% 
+  filter(p.adjust < 0.05)
+
+library(enrichplot)
+library(ggplot2)
+em <- filter(em, ID %in% em_res$ID)
+em@result$Description <- gsub(" -.+","",em@result$Description)
+barplot(em, showCategory=15) +
+  scale_y_discrete(labels=function(x) stringr::str_wrap(x, width=40))
+```
+
+Subsequently, we extracted genes that have protein interactions with oxidative phosphorylation pathway genes from the STRING database to form a protein-protein interaction network. 
+
+```{r eval=FALSE, include=TRUE}
+library(rbioapi)
+kegg <- readRDS("~/meta_target/data/kegg_all_pathway.rds")
+kegg <- kegg %>% 
+  filter(grepl("Metabolism",class) | grepl("metabolism",pathway)) %>% 
+  mutate(pathway = gsub(" \\- Homo sapiens \\(human\\)","",pathway))
+oxi <- kegg %>% filter(pathway == "Oxidative phosphorylation")
+oxi <- oxi %>% select(genes)
+proteins <- oxi$genes
+## map our protein IDs
+proteins_mapped <- rba_string_map_ids(ids = proteins, species = 9606)
+int_partners <- rba_string_interaction_partners(ids = proteins_mapped$stringId,
+                                                species = 9606,
+                                                required_score = 700)
+saveRDS(int_partners, file = "~/hypoxia_target/data/ppi_oxi.rds")
+```
+
+The network has a total of 413 gene nodes, of which 33 genes are in our screening list. We extracted the smallest subgraph connecting these 33 gene nodes by minimum spanning tree based approximation (KB) algorithm.
+
+```{r}
+all_res_meta <- readRDS("~/hypoxia_target/data/filter_target0331.rds")
+ppi_oxi <- readRDS("~/hypoxia_target/data/ppi_oxi.rds")
+all_res_meta <- all_res_meta %>% 
+  filter(exp_diff_fdr < 0.05 & exp_fc > 1) %>% 
+  mutate(pertur_stat = (-log10(Goal_end_FDR)) * log10(abs_fc)) %>% 
+  mutate(exp_stat = (-log10(exp_diff_fdr)) * log10(exp_fc)) %>% 
+  arrange(desc(pertur_stat),desc(exp_stat))
+
+dt <- ppi_oxi %>% 
+  filter(score > 0.9) %>% 
+  select(preferredName_A, preferredName_B)
+dt_in <- data.frame(
+  genes = c(unique(c(dt$preferredName_A,dt$preferredName_B)))
+) %>% 
+  mutate(Type = ifelse(genes %in% all_res_meta$Gene_name,"yes","no"))
+dt_in$Type <- factor(dt_in$Type, levels = c("yes","no"))
+
+library(ggnetwork)
+graph <- simplify(graph_from_data_frame(d = dt, 
+                                        vertices = dt_in, 
+                                        directed = FALSE))
+n <- ggnetwork::ggnetwork(graph, arrow.gap = 0, 
+                          layout= igraph::layout_with_fr(graph))
+ggplot(n, aes(x = .data$x, y = .data$y, 
+              xend = .data$xend, 
+              yend = .data$yend)) + 
+  geom_edges(color = "grey75",
+             alpha = 0.5, 
+             curvature = 0, 
+             show.legend = FALSE) + 
+  geom_nodes(aes(color = .data$Type)) + 
+  ggnetwork::theme_blank()
+
+####提取子图
+library(igraph)
+library(SteinerNet)
+library(qgraph)
+
+ppi_g <- graph_from_data_frame(dt)
+in_genes <- dt_in$genes[which(dt_in$Type == "yes")]
+out <- steinertree(type = "KB", terminals = in_genes,
+                   graph = ppi_g, color = FALSE)
+out_dt <- as_data_frame(out[[1]])
+##plot
+out_g <- graph_from_data_frame(out_dt,directed = F)
+
+kegg <- readRDS("~/meta_target/data/kegg_all_pathway.rds")
+kegg <- kegg %>% 
+  filter(grepl("Metabolism",class) | grepl("metabolism",pathway)) %>% 
+  mutate(pathway = gsub(" \\- Homo sapiens \\(human\\)","",pathway))
+oxi <- kegg %>% filter(pathway == "Oxidative phosphorylation")
+oxi <- oxi %>% select(genes)
+oxi_gene <- in_genes[which((in_genes %in% oxi$genes))]
+not_oxi_gene <- in_genes[which(!(in_genes %in% oxi$genes))]
+V(out_g)[oxi_gene]$color <- "#11325D"
+V(out_g)[not_oxi_gene]$color <- "#F5A673"
+e <- get.edgelist(out_g,names=FALSE)
+l <- qgraph.layout.fruchtermanreingold(e,vcount=vcount(out_g))
+par(mar=c(0,0,0,0)+.1)
+plot(out_g,vertex.size=8, edge.arrow.size=0.3,
+     vertex.label = V(out_g)$name,
+     vertex.label.dist=1.5,layout=l, vertex.label.cex = 0.8)
+```
+
+We found that there are two genes in this subgraph that are not genes in the oxidative phosphorylation pathway (FLAD1 and SUCLG1). Since oxidative phosphorylation is also important in normal cells, these two genes may be potential hypoxia targets.
+
+```{r}
+all_res_meta <- readRDS("~/hypoxia_target/data/filter_target0331.rds")
+tt <- all_res_meta %>% 
+  filter(Gene_name %in% in_genes) %>% 
+  filter(exp_diff_fdr < 0.05 & exp_fc > 1) %>% 
+  mutate(pertur_pre_stat = (-log10(Goal_end_FDR)) * abs_fc) %>% 
+  mutate(exp_pre_stat = (-log10(exp_diff_fdr)) * exp_fc) %>% 
+  mutate(pertur_stat = log10(pertur_pre_stat),
+         exp_stat = log10(exp_pre_stat)) %>% 
+  arrange(desc(pertur_stat),desc(exp_stat))
+
+dt <- tt %>% select(Gene_name,exp_stat,pertur_stat) %>% 
+  rename(`Differential Expression Stat`=exp_stat,
+         `Perturbation Stat`=pertur_stat) %>% 
+  tidyr::pivot_longer(cols = c("Differential Expression Stat",
+                               "Perturbation Stat"),
+                      names_to = "Score Type",values_to = "score")
+
+x_to_highlight <- "FLAD1"
+ggbarplot(dt,x="Gene_name",y="score",fill = "Score Type",
+          position = position_dodge(0.9),xlab = F,ylab = "log10(Score)") +
+  theme(axis.text.x = element_markdown(angle = 90, vjust = 0.5, hjust = 1))+
+  scale_x_discrete(labels = ~ case_when(
+    .x %in% x_to_highlight ~ paste0("<span style='color: red'><b>", .x, "</b></span>"),
+    TRUE ~ .x
+  ))
+```
+
+We further compared the expression differences of these genes in tumors and normal tissues:
+
+```{r}
+all_res_meta <- readRDS("~/hypoxia_target/data/filter_target0331.rds")
+tt <- all_res_meta %>% 
+  filter(Gene_name %in% in_genes) %>% 
+  filter(exp_diff_fdr < 0.05 & exp_fc > 1) %>% 
+  mutate(pertur_pre_stat = (-log10(Goal_end_FDR)) * abs_fc) %>% 
+  mutate(exp_pre_stat = (-log10(exp_diff_fdr)) * exp_fc) %>% 
+  mutate(pertur_stat = log10(pertur_pre_stat),
+         exp_stat = log10(exp_pre_stat)) %>% 
+  arrange(desc(pertur_stat),desc(exp_stat))
+
+luad <- data.table::fread("/home/data/sdb/wt/TCGA-LUAD.htseq_fpkm-uq.tsv.gz",
+                          data.table = F)
+luad <- luad %>% filter(Ensembl_ID %in% tt$id)
+rownames(luad) <- luad$Ensembl_ID
+luad$Ensembl_ID <- NULL
+lusc <- data.table::fread("/home/data/sdb/wt/TCGA-LUSC.htseq_fpkm-uq.tsv.gz",
+                          data.table = F)
+lusc <- lusc %>% filter(Ensembl_ID %in% tt$id)
+rownames(lusc) <- lusc$Ensembl_ID
+lusc$Ensembl_ID <- NULL
+
+lung_exp <- bind_cols(luad,lusc)
+lung_exp <- t(lung_exp) %>% as.data.frame()
+lung_exp$sample <- rownames(lung_exp)
+lung_exp <- lung_exp %>% 
+  mutate(sample_type = ifelse(as.numeric(substr(sample,14,15)) < 11,"cancer","normal"))
+lung_exp <- lung_exp %>% select(sample,sample_type,everything())
+lung_exp <- lung_exp %>% tidyr::pivot_longer(cols = 3:ncol(lung_exp),
+                                             names_to = "gene",
+                                             values_to = "exp")
+lung_exp <- left_join(
+  lung_exp,
+  tt %>% select(id,Gene_name) %>% rename(gene=id)
+)
+
+diff_res <- data.frame(ids = unique(lung_exp$Gene_name),
+                       p_value = NA)
+for (i in 1:nrow(diff_res)){
+  dt <- lung_exp %>% 
+    select(sample_type,Gene_name,exp) %>% 
+    filter(Gene_name == diff_res$ids[i])
+  dt$sample_type <- factor(dt$sample_type,levels = c("cancer","normal"))
+  dt_res <- wilcox.test(exp ~ sample_type, data=dt)
+  diff_res$p_value[i] <- dt_res$p.value
+}
+diff_res <- diff_res %>% arrange(p_value)
+diff_res <- diff_res %>% 
+  mutate(group1 = "cancer", group2 = "normal") %>% 
+  rename(Gene_name = ids) %>% 
+  mutate(y.position = 25)
+diff_res$p.adj <- p.adjust(diff_res$p_value,"fdr")
+diff_res$p.adj <- format(diff_res$p.adj,digits = 2)
+
+lung_exp$Gene_name <- factor(lung_exp$Gene_name,levels = diff_res$Gene_name)
+lung_exp$sample_type <- factor(lung_exp$sample_type,levels = c("normal","cancer"))
+
+library(ggprism)
+
+ggplot(lung_exp, aes(x = Gene_name, y = exp)) +
+  geom_boxplot(aes(fill = sample_type)) +
+  add_pvalue(diff_res, x = "Gene_name")+
+  theme_prism()+
+  rotate_x_text(90)+
+  labs(y="log2(FPKM-UQ + 1)")+
+  theme(axis.title.x = element_blank())
+```
 
 
 

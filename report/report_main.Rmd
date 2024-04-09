@@ -1,0 +1,48 @@
+---
+title: "Deep learning reveals the metabolic dependency of hypoxic tumor cells and the critical function of FLAD1 mediated mitochondrial metabolic reprogramming"
+author: ["Tao Wu","Xue-Song Liu (Corresponding author)"]
+date: "`r Sys.Date()`"
+output:
+  rmdformats::readthedown:
+    highlight: kate
+    toc_depth: 3
+    self_contained: false
+---
+
+
+```{r knitr_init, echo=FALSE,warning=FALSE}
+library(knitr)
+library(rmdformats)
+## Global options
+options(max.print = "75")
+opts_chunk$set(
+  echo = TRUE,
+  comment = "#>",
+  dpi = 300,
+  cache = FALSE
+)
+opts_knit$set(width = 75)
+Sys.setenv("LANGUAGE"="EN")
+```
+
+# Dependencies
+
+```{r lib3, eval=TRUE, include=TRUE, message=FALSE}
+library(yardstick)
+library(dplyr)
+library(ggplot2)
+library(ggprism)
+library(patchwork)
+library(ggpubr)
+```
+
+# Network analysis
+
+```{r child = 'network_analysis.Rmd'}
+```
+
+# In silico perturbation
+
+```{r child = 'in_silico_perturbation.Rmd'}
+```
+

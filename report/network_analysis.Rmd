@@ -10,13 +10,13 @@ output:
     mathjax: true
 ---
 
-```{r tcga_analysis-setup, include=FALSE}
+```{r network_analysis-setup, include=FALSE}
 options(max.print = "75")
 knitr::opts_chunk$set(echo = TRUE, comment = "#>", eval = TRUE, collapse = TRUE,cache = FALSE)
 knitr::opts_knit$set(width = 75)
 ```
 
-```{r}
+```{r include=FALSE}
 library(dplyr)
 library(ggpubr)
 ```
@@ -25,7 +25,7 @@ Sample specific GEMs were download in mat format and convert to xml format by Ma
 
 We use Graph2Vec, an algorithm designed to learn vector representations  for whole graphs, to compute the embedding vector for each sample's enzyme network. Then we use cosine similarity to calculate the  similarity between pairs of enzyme networks (the code for calculating graph similarity can be found in `code/graph_sim.ipynb`). Based on the Buffa hypoxia  score, samples are divided into hypoxic (score greater than the upper  quartile) and non-hypoxic groups (score less than the lower quartile). We compared the differences in network similarity between samples with  the same hypoxia status and those with different hypoxia statuses.
 
-```{r}
+```{r,fig.height=8}
 sim <- data.table::fread("/home/data/sdb/wt/enzyme_net_sim.csv",data.table = F)
 sim$V1 <- NULL
 rownames(sim) <- colnames(sim)
@@ -214,7 +214,7 @@ saveRDS(sim_res, file = "/home/data/sdb/wt/met_net_dist.rds")
 
 The the differences in this network distance between samples with the same hypoxia status and those with different hypoxia statuses were calculated.
 
-```{r}
+```{r,fig.height=8}
 rm(list = ls())
 gc()
 
