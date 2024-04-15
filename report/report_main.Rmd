@@ -1,5 +1,5 @@
 ---
-title: "Deep learning reveals the metabolic dependency of hypoxic tumor cells and the critical function of FLAD1 mediated mitochondrial metabolic reprogramming"
+title: "Deep learning reveals the metabolic vulnerability of hypoxic tumor cells and the critical function of FLAD1 mediated tumor hypoxia adaption"
 author: ["Tao Wu","Xue-Song Liu (Corresponding author)"]
 date: "`r Sys.Date()`"
 output:
