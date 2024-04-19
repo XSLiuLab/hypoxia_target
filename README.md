@@ -20,6 +20,6 @@ The code for fine tuning can be found in scripts. The fine-tuned model, correspo
 We thank ShanghaiTech University High Performance Computing Public Service Platform for computing services. We thank multi-omics facility, molecular and cell biology core facility of ShanghaiTech University for technical help. This work is supported by cross disciplinary Research Fund of Shanghai Ninth People's Hospital, Shanghai JiaoTong University School of Medicine (JYJC202227). Shanghai Science and Technology Commission (21ZR1442400), National Natural Science Foundation of China (82373149), and startup funding from ShanghaiTech University. 
 
 ## Citation
-Xiangyu Zhao, Tao Wu & Xue-Song Liu. Deep learning reveals the metabolic vulnerability of hypoxic tumor cells and the critical function of FLAD1 mediated tumor hypoxia adaption (Submitted)
+Xiangyu Zhao, Tao Wu & Xue-Song Liu. Deep learning reveals hypoxia vulnerability and FLAD1 as a potential target (Submitted)
 
 
